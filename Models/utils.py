@@ -36,8 +36,7 @@ class EnsembleLinearBayesian(BayesianModule):
 
     def forward(self, x):
         if x.ndim == 3: x = x.squeeze()
-        if x.ndim == 2:
-            x = x.unsqueeze(0).repeat(self.num_members,1,1)
+        if x.ndim == 2: x = x.unsqueeze(0).repeat(self.num_members,1,1)
         # print(x.dim())
         if self.freeze:
             xw = torch.stack([self.member_layers[i].forward_frozen(x[i]) for i in range(self.num_members)])

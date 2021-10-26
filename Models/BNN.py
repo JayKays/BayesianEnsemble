@@ -1,7 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
+
 import pathlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -16,50 +13,14 @@ import mbrl.util.math
 from mbrl.models.model import Ensemble
 from mbrl.models.util import EnsembleLinearLayer, truncated_normal_init
 
-from .utils import EnsembleLinearBayesian
 from blitz.modules.base_bayesian_module import BayesianModule
 from blitz.losses.kl_divergence import kl_divergence_from_nn
 
+from .utils import EnsembleLinearBayesian
+
 class BNN(Ensemble):
-    """Implements an ensemble of multi-layer perceptrons each modeling a Gaussian distribution.
-    This model corresponds to a Probabilistic Ensemble in the Chua et al.,
-    NeurIPS 2018 paper (PETS) https://arxiv.org/pdf/1805.12114.pdf
-    It predicts per output mean and log variance, and its weights are updated using a Gaussian
-    negative log likelihood loss. The log variance is bounded between learned ``min_log_var``
-    and ``max_log_var`` parameters, trained as explained in Appendix A.1 of the paper.
-    This class can also be used to build an ensemble of GaussianMLP models, by setting
-    ``ensemble_size > 1`` in the constructor. Then, a single forward pass can be used to evaluate
-    multiple independent MLPs at the same time. When this mode is active, the constructor will
-    set ``self.num_members = ensemble_size``.
-    For the ensemble variant, uncertainty propagation methods are available that can be used
-    to aggregate the outputs of the different models in the ensemble.
-    Valid propagation options are:
-            - "random_model": for each output in the batch a model will be chosen at random.
-              This corresponds to TS1 propagation in the PETS paper.
-            - "fixed_model": for output j-th in the batch, the model will be chosen according to
-              the model index in `propagation_indices[j]`. This can be used to implement TSinf
-              propagation, described in the PETS paper.
-            - "expectation": the output for each element in the batch will be the mean across
-              models.
-    The default value of ``None`` indicates that no uncertainty propagation, and the forward
-    method returns all outputs of all models.
-    Args:
-        in_size (int): size of model input.
-        out_size (int): size of model output.
-        device (str or torch.device): the device to use for the model.
-        num_layers (int): the number of layers in the model
-                          (e.g., if ``num_layers == 3``, then model graph looks like
-                          input -h1-> -h2-> -l3-> output).
-        ensemble_size (int): the number of members in the ensemble. Defaults to 1.
-        hid_size (int): the size of the hidden layers (e.g., size of h1 and h2 in the graph above).
-        deterministic (bool): if ``True``, the model will be trained using MSE loss and no
-            logvar prediction will be done. Defaults to ``False``.
-        propagation_method (str, optional): the uncertainty propagation method to use (see
-            above). Defaults to ``None``.
-        learn_logvar_bounds (bool): if ``True``, the logvar bounds will be learned, otherwise
-            they will be constant. Defaults to ``False``.
-        activation_fn_cfg (dict or omegaconf.DictConfig, optional): configuration of the
-            desired activation function. Defaults to torch.nn.ReLU when ``None``.
+    """Implements a linear Bayesian Ensemble with the help of blitz,
+    in a similar fassion as the Gaussian MLP from mbrl-lib.
     """
 
     def __init__(
@@ -71,6 +32,7 @@ class BNN(Ensemble):
         ensemble_size: int = 1,
         hid_size: int = 200,
         deterministic: bool = True,
+        freeze: bool = False,
         propagation_method: Optional[str] = None,
         learn_logvar_bounds: bool = False,
         activation_fn_cfg: Optional[Union[Dict, omegaconf.DictConfig]] = None,
@@ -97,7 +59,7 @@ class BNN(Ensemble):
         hidden_layers = [
             nn.Sequential(create_linear_layer(in_size, hid_size), create_activation())
         ]
-        for i in range(num_layers - 1):
+        for _ in range(num_layers - 1):
             hidden_layers.append(
                 nn.Sequential(
                     create_linear_layer(hid_size, hid_size),
@@ -106,13 +68,17 @@ class BNN(Ensemble):
             )
         self.hidden_layers = nn.Sequential(*hidden_layers)
 
-        self.mean_and_logvar = create_linear_layer(hid_size, out_size)
+        self.output_layer = create_linear_layer(hid_size, out_size)
         
-        self.frozen = deterministic
         # self.apply(truncated_normal_init)
-        self.to(self.device)
 
+        self.freeze = freeze
+
+        if self.freeze: self.freeze_model()
+
+        self.to(self.device)
         self.elite_models: List[int] = None
+
 
     def _maybe_toggle_layers_use_only_elite(self, only_elite: bool):
         if self.elite_models is None:
@@ -122,24 +88,20 @@ class BNN(Ensemble):
                 # each layer is (linear layer, activation_func)
                 layer[0].set_elite(self.elite_models)
                 layer[0].toggle_use_only_elite()
-            self.mean_and_logvar.set_elite(self.elite_models)
-            self.mean_and_logvar.toggle_use_only_elite()
+            self.output_layer.set_elite(self.elite_models)
+            self.output_layer.toggle_use_only_elite()
 
     def _default_forward(
         self, x: torch.Tensor, only_elite: bool = False, **_kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self._maybe_toggle_layers_use_only_elite(only_elite)
+
         x = self.hidden_layers(x)
-        mean_and_logvar = self.mean_and_logvar(x)
+        output = self.output_layer(x)
+
         self._maybe_toggle_layers_use_only_elite(only_elite)
-        if self.deterministic:
-            return mean_and_logvar, None
-        else:
-            mean = mean_and_logvar[..., : self.out_size]
-            logvar = mean_and_logvar[..., self.out_size :]
-            logvar = self.max_logvar - F.softplus(self.max_logvar - logvar)
-            logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
-            return mean, logvar
+
+        return output
 
     def _forward_from_indices(
         self, x: torch.Tensor, model_shuffle_indices: torch.Tensor
@@ -153,16 +115,12 @@ class BNN(Ensemble):
             num_models, batch_size // num_models, -1
         )
 
-        mean, logvar = self._default_forward(shuffled_x, only_elite=True)
-        # note that mean and logvar are shuffled
-        mean = mean.view(batch_size, -1)
-        mean[model_shuffle_indices] = mean.clone()  # invert the shuffle
+        pred = self._default_forward(shuffled_x, only_elite=True)
+        # note that pred is shuffled
+        pred = pred.view(batch_size, -1)
+        pred[model_shuffle_indices] = pred.clone()  # invert the shuffle
 
-        if logvar is not None:
-            logvar = logvar.view(batch_size, -1)
-            logvar[model_shuffle_indices] = logvar.clone()  # invert the shuffle
-
-        return mean, logvar
+        return pred
 
     def _forward_ensemble(
         self,
@@ -171,11 +129,10 @@ class BNN(Ensemble):
         propagation_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.propagation_method is None:
-            mean, logvar = self._default_forward(x, only_elite=False)
+            mean = self._default_forward(x, only_elite=False)
             if self.num_members == 1:
                 mean = mean[0]
-                logvar = logvar[0] if logvar is not None else None
-            return mean, logvar
+            return mean
         assert x.ndim == 2
         model_len = (
             len(self.elite_models) if self.elite_models is not None else len(self)
@@ -199,10 +156,9 @@ class BNN(Ensemble):
                 )
             return self._forward_from_indices(x, propagation_indices)
         if self.propagation_method == "expectation":
-            mean, logvar = self._default_forward(x, only_elite=True)
-            if self.deterministic: 
-                return mean.mean(dim=0)
-            return mean.mean(dim=0), logvar.mean(dim=0)
+            pred = self._default_forward(x, only_elite=True)
+            return pred.mean(dim=0)
+
         raise ValueError(f"Invalid propagation method {self.propagation_method}.")
 
     def forward(  # type: ignore
@@ -212,50 +168,9 @@ class BNN(Ensemble):
         propagation_indices: Optional[torch.Tensor] = None,
         use_propagation: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes mean and logvar predictions for the given input.
-        When ``self.num_members > 1``, the model supports uncertainty propagation options
-        that can be used to aggregate the outputs of the different models in the ensemble.
-        Valid propagation options are:
-            - "random_model": for each output in the batch a model will be chosen at random.
-              This corresponds to TS1 propagation in the PETS paper.
-            - "fixed_model": for output j-th in the batch, the model will be chosen according to
-              the model index in `propagation_indices[j]`. This can be used to implement TSinf
-              propagation, described in the PETS paper.
-            - "expectation": the output for each element in the batch will be the mean across
-              models.
-        If a set of elite models has been indicated (via :meth:`set_elite()`), then all
-        propagation methods will operate with only on the elite set. This has no effect when
-        ``propagation is None``, in which case the forward pass will return one output for
-        each model.
-        Args:
-            x (tensor): the input to the model. When ``self.propagation is None``,
-                the shape must be ``E x B x Id`` or ``B x Id``, where ``E``, ``B``
-                and ``Id`` represent ensemble size, batch size, and input dimension,
-                respectively. In this case, each model in the ensemble will get one slice
-                from the first dimension (e.g., the i-th ensemble member gets ``x[i]``).
-                For other values of ``self.propagation`` (and ``use_propagation=True``),
-                the shape must be ``B x Id``.
-            rng (torch.Generator, optional): random number generator to use for "random_model"
-                propagation.
-            propagation_indices (tensor, optional): propagation indices to use,
-                as generated by :meth:`sample_propagation_indices`. Ignore if
-                `use_propagation == False` or `self.propagation_method != "fixed_model".
-            use_propagation (bool): if ``False``, the propagation method will be ignored
-                and the method will return outputs for all models. Defaults to ``True``.
-        Returns:
-            (tuple of two tensors): the predicted mean and log variance of the output. If
-            ``propagation is not None``, the output will be 2-D (batch size, and output dimension).
-            Otherwise, the outputs will have shape ``E x B x Od``, where ``Od`` represents
-            output dimension.
-        Note:
-            For efficiency considerations, the propagation method used by this class is an
-            approximate version of that described by Chua et al. In particular, instead of
-            sampling models independently for each input in the batch, we ensure that each
-            model gets exactly the same number of samples (which are assigned randomly
-            with equal probability), resulting in a smaller batch size which we use for the forward
-            pass. If this is a concern, consider using ``propagation=None``, and passing
-            the output to :func:`mbrl.util.math.propagate`.
+        """Predictions for the given input.
         """
+        
         if use_propagation:
             return self._forward_ensemble(
                 x, rng=rng, propagation_indices=propagation_indices
@@ -264,34 +179,17 @@ class BNN(Ensemble):
 
     def _mse_loss(self, model_in: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         assert model_in.ndim == target.ndim
-        # if model_in.ndim == 2:  # add model dimension
-        #     model_in = model_in.unsqueeze(0)
-        #     target = target.unsqueeze(0)
-        pred_mean, _ = self.forward(model_in, use_propagation=False)
+        
+        pred_mean = self.forward(model_in, use_propagation=False)
         return F.mse_loss(pred_mean, target, reduction="none").sum((1, 2)).sum()
-
-    def _nll_loss(self, model_in: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        assert model_in.ndim == target.ndim
-        if model_in.ndim == 2:  # add ensemble dimension
-            model_in = model_in.unsqueeze(0)
-            target = target.unsqueeze(0)
-        pred_mean, pred_logvar = self.forward(model_in, use_propagation=False)
-        if target.shape[0] != self.num_members:
-            target = target.repeat(self.num_members, 1, 1)
-        nll = (
-            mbrl.util.math.gaussian_nll(pred_mean, pred_logvar, target, reduce=False)
-            .mean((1, 2))  # average over batch and target dimension
-            .sum()
-        )  # sum over ensemble dimension
-        nll += 0.01 * (self.max_logvar.sum() - self.min_logvar.sum())
-        return nll
 
     def loss(
         self,
         model_in: torch.Tensor,
         target: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Computes Gaussian NLL loss.
+        """Computes the samples the ELBO loss via variational MonteCarlo, if froze
+            the mse loss is instead calculated.
         It also includes terms for ``max_logvar`` and ``min_logvar`` with small weights,
         with positive and negative signs, respectively.
         This function returns no metadata, so the second output is set to an empty dict.
@@ -307,10 +205,10 @@ class BNN(Ensemble):
             the model over the given input/target. If the model is an ensemble, returns
             the average over all models.
         """
-        # if self.deterministic:
-        #     return self._mse_loss(model_in, target), {}
-        # else:
-        #     return self._nll_loss(model_in, target), {}
+        if self.freeze:
+            self.freeze_model()
+            return self._mse_loss(model_in, target), {}
+
         return self.sample_elbo(model_in, target), {}
 
     def nn_kl_divergence(self):
@@ -340,8 +238,6 @@ class BNN(Ensemble):
                 inputs: torch.tensor -> the input data to the model
                 labels: torch.tensor -> label data for the performance-part of the loss calculation
                         The shape of the labels must match the label-parameter shape of the criterion (one hot encoded or as index, if needed)
-                criterion: torch.nn.Module, custom criterion (loss) function, torch.nn.functional function -> criterion to gather
-                            the performance cost for the model
                 sample_nbr: int -> The number of times of the weight-sampling and predictions done in our Monte-Carlo approach to
                             gather the loss to be .backwarded in the optimization of the model.
         """
@@ -370,9 +266,9 @@ class BNN(Ensemble):
         """
         assert model_in.ndim == 2 and target.ndim == 2
         with torch.no_grad():
-            pred_mean, _ = self.forward(model_in, use_propagation=False)
+            pred = self.forward(model_in, use_propagation=False)
             target = target.repeat((self.num_members, 1, 1))
-            return F.mse_loss(pred_mean, target, reduction="none"), {}
+            return F.mse_loss(pred, target, reduction="none"), {}
 
     def sample_propagation_indices(
         self, batch_size: int, _rng: torch.Generator
@@ -396,6 +292,8 @@ class BNN(Ensemble):
         """
         Freezes the model by making it predict using only the expected value to their BayesianModules' weights distributions
         """
+        self.freeze = True
+
         for module in self.modules():
             if isinstance(module, (BayesianModule)):
                 module.freeze = True
@@ -404,7 +302,8 @@ class BNN(Ensemble):
         """
         Unfreezes the model by letting it draw its weights with uncertanity from their correspondent distributions
         """
-        
+        self.freeze = False
+
         for module in self.modules():
             if isinstance(module, (BayesianModule)):
                 module.freeze = False
